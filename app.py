@@ -88,7 +88,8 @@ def process_cityjson_feature(cityjson_feature, center_lat, center_lon, radius):
     # Get the vertex array and transform (for scaling coordinates)
     vertices_array = cityjson_feature['vertices']
     transform = cityjson_feature.get('transform', {})
-    scale = transform.get('scale', [1, 1, 1])
+    # Default scale to 0.001 (millimeters to meters) and translate to 0
+    scale = transform.get('scale', [0.001, 0.001, 0.001])
     translate = transform.get('translate', [0, 0, 0])
     
     # Process each building in CityObjects
@@ -342,6 +343,22 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             if features:
                 with st.expander("🔍 Debug: Eerste gebouw structuur"):
                     st.json(features[0])
+                    # Show what happens with first vertex
+                    if 'vertices' in features[0] and len(features[0]['vertices']) > 0:
+                        v = features[0]['vertices'][0]
+                        transform = features[0].get('transform', {})
+                        scale = transform.get('scale', [0.001, 0.001, 0.001])
+                        translate = transform.get('translate', [0, 0, 0])
+                        x = v[0] * scale[0] + translate[0]
+                        y = v[1] * scale[1] + translate[1]
+                        z = v[2] * scale[2] + translate[2]
+                        st.write(f"Raw vertex: {v}")
+                        st.write(f"Scale: {scale}, Translate: {translate}")
+                        st.write(f"Transformed to RD: ({x:.2f}, {y:.2f}, {z:.2f})")
+                        
+                        transformer_test = Transformer.from_crs("EPSG:7415", "EPSG:4326", always_xy=True)
+                        lon, lat, height = transformer_test.transform(x, y, z)
+                        st.write(f"Transformed to WGS84: ({lat:.6f}, {lon:.6f}, {height:.2f})")
             
             heights = [0, 0, 0, 0]
             counts = [0, 0, 0, 0]
