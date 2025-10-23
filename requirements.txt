@@ -1,0 +1,12 @@
+streamlit
+folium
+streamlit-folium
+pyproj
+numpy
+branca
+opencage
+geopy
+matplotlib
+plotly
+reportlab==4.0.4
+
