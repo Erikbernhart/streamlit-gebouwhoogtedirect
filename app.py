@@ -77,116 +77,99 @@ def fetch_buildings_from_api(center_lat, center_lon, radius):
     return all_features
 
 
-def process_cityjson_feature(feature, center_lat, center_lon, radius):
-    """Process a single CityJSONFeature"""
+def process_cityjson_feature(cityjson_feature, center_lat, center_lon, radius):
+    """Process a single CityJSONFeature - handles the CityJSON format from 3DBAG API"""
     transformer = Transformer.from_crs("EPSG:7415", "EPSG:4326", always_xy=True)
     
-    # Debug: print feature structure for first feature
-    if 'properties' not in feature:
-        st.warning(f"Feature missing properties: {list(feature.keys())}")
+    # CityJSONFeature has: CityObjects, vertices, transform
+    if 'CityObjects' not in cityjson_feature or 'vertices' not in cityjson_feature:
         return None
     
-    props = feature['properties']
-    building_max = props.get('b3_h_dak_50p')
-    building_maaiveld = props.get('b3_h_maaiveld')
-    ground_area = props.get('b3_opp_grond')
+    # Get the vertex array and transform (for scaling coordinates)
+    vertices_array = cityjson_feature['vertices']
+    transform = cityjson_feature.get('transform', {})
+    scale = transform.get('scale', [1, 1, 1])
+    translate = transform.get('translate', [0, 0, 0])
     
-    if building_max is None or building_maaiveld is None:
-        return None
+    # Process each building in CityObjects
+    results = []
     
-    building_height = building_max - building_maaiveld
-    building_height_rounded = round(building_height)
-    
-    if 'geometry' not in feature:
-        st.warning("Feature missing geometry")
-        return None
-    
-    geometry = feature['geometry']
-    
-    # Handle different geometry types from the API
-    if geometry['type'] == 'MultiSurface':
+    for obj_id, city_object in cityjson_feature['CityObjects'].items():
+        if city_object.get('type') != 'Building':
+            continue
+        
+        # Get building attributes
+        attrs = city_object.get('attributes', {})
+        building_max = attrs.get('b3_h_dak_50p')
+        building_maaiveld = attrs.get('b3_h_maaiveld')
+        ground_area = attrs.get('b3_opp_grond')
+        
+        if building_max is None or building_maaiveld is None:
+            continue
+        
+        building_height = building_max - building_maaiveld
+        building_height_rounded = round(building_height)
+        
+        # Get geometry (usually first geometry at LoD 0 or footprint)
+        geometries = city_object.get('geometry', [])
+        if not geometries:
+            continue
+        
+        # Use first geometry (footprint)
+        geometry = geometries[0]
+        boundaries = geometry.get('boundaries', [])
+        
+        if not boundaries:
+            continue
+        
+        # Convert vertex indices to actual coordinates
         all_vertices = []
         
         try:
-            # MultiSurface structure from API
-            if 'coordinates' in geometry:
-                for surface in geometry['coordinates']:
-                    if isinstance(surface, list):
-                        for ring in surface:
-                            if isinstance(ring, list):
-                                for coord in ring:
-                                    if len(coord) >= 3:
-                                        lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
-                                        all_vertices.append((lat, lon, height))
-        except (IndexError, KeyError, TypeError) as e:
-            st.warning(f"Error parsing geometry: {e}")
-            return None
+            # For MultiSurface: boundaries is list of surfaces
+            for surface in boundaries:
+                for ring in surface:
+                    for vertex_index in ring:
+                        if vertex_index < len(vertices_array):
+                            # Get vertex and apply transform
+                            v = vertices_array[vertex_index]
+                            x = v[0] * scale[0] + translate[0]
+                            y = v[1] * scale[1] + translate[1]
+                            z = v[2] * scale[2] + translate[2]
+                            
+                            # Transform from RD to WGS84
+                            lon, lat, height = transformer.transform(x, y, z)
+                            all_vertices.append((lat, lon, height))
+        except (IndexError, KeyError, TypeError):
+            continue
         
         if not all_vertices:
-            st.warning("No vertices found after transformation")
-            return None
+            continue
         
+        # Calculate centroid
         latitudes = [v[0] for v in all_vertices]
         longitudes = [v[1] for v in all_vertices]
         centroid = (np.mean(latitudes), np.mean(longitudes))
         
+        # Check if within radius
         distance = geodesic((center_lat, center_lon), centroid).meters
         if distance > radius:
-            return None
+            continue
         
+        # Use provided ground area or calculate it
         if ground_area is None:
-            coords_2d = [(v[0], v[1]) for v in all_vertices[:min(len(all_vertices), 100)]]
+            coords_2d = [(v[0], v[1]) for v in all_vertices]
             ground_area = calculate_area(coords_2d) if len(coords_2d) >= 3 else 0
         
-        return {
+        results.append({
             'height': building_height_rounded,
             'centroid': centroid,
             'vertices': all_vertices,
             'area': ground_area,
             'distance': distance
-        }
+        })
     
-    # Handle Solid geometry type (common in 3DBAG)
-    elif geometry['type'] == 'Solid':
-        all_vertices = []
-        
-        try:
-            if 'coordinates' in geometry:
-                # Solid has one shell containing multiple surfaces
-                for shell in geometry['coordinates']:
-                    for surface in shell:
-                        for ring in surface:
-                            for coord in ring:
-                                if len(coord) >= 3:
-                                    lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
-                                    all_vertices.append((lat, lon, height))
-        except (IndexError, KeyError, TypeError) as e:
-            return None
-        
-        if not all_vertices:
-            return None
-        
-        latitudes = [v[0] for v in all_vertices]
-        longitudes = [v[1] for v in all_vertices]
-        centroid = (np.mean(latitudes), np.mean(longitudes))
-        
-        distance = geodesic((center_lat, center_lon), centroid).meters
-        if distance > radius:
-            return None
-        
-        if ground_area is None:
-            coords_2d = [(v[0], v[1]) for v in all_vertices[:min(len(all_vertices), 100)]]
-            ground_area = calculate_area(coords_2d) if len(coords_2d) >= 3 else 0
-        
-        return {
-            'height': building_height_rounded,
-            'centroid': centroid,
-            'vertices': all_vertices,
-            'area': ground_area,
-            'distance': distance
-        }
-    
-    return None
+    return results
 
 
 def calculate_area(vertices):
