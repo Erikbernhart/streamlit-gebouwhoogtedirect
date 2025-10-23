@@ -9,7 +9,6 @@ from geopy.distance import geodesic
 import math
 import requests
 import time
-from folium.features import DivIcon
 from folium.elements import Element
 from streamlit_folium import folium_static
 import matplotlib.pyplot as plt
@@ -23,92 +22,65 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 
 
-# Function to calculate the radius based on building height
 def calculate_radius(height):
+    """Calculate the analysis radius based on building height"""
     if height <= 40:
         return max(50 * height, 500)
     elif 40 < height <= 80:
         return 75 * height - 1000
-    else:  # height > 80
+    else:
         return 5000
 
 
-# Function to fetch buildings from 3DBAG API
 def fetch_buildings_from_api(center_lat, center_lon, radius):
-    """
-    Fetch buildings from 3DBAG API within a bounding box around the center point.
-    
-    Args:
-        center_lat: Latitude of center point (WGS84)
-        center_lon: Longitude of center point (WGS84)
-        radius: Radius in meters
-    
-    Returns:
-        List of CityJSONFeature objects
-    """
-    # Transform center point from WGS84 to RD New (EPSG:7415)
+    """Fetch buildings from 3DBAG API within a bounding box"""
     transformer_to_rd = Transformer.from_crs("EPSG:4326", "EPSG:7415", always_xy=True)
     center_x, center_y, _ = transformer_to_rd.transform(center_lon, center_lat, 0)
     
-    # Calculate bounding box in RD coordinates
     bbox_xmin = center_x - radius
     bbox_ymin = center_y - radius
     bbox_xmax = center_x + radius
     bbox_ymax = center_y + radius
     
-    # Build API URL with bbox parameter
     base_url = "https://api.3dbag.nl/collections/pand/items"
-    
     all_features = []
-    limit = 100  # Number of features per request
-    offset = 0
+    limit = 100
+    page = 0
     
-    st.info(f"Fetching buildings from 3DBAG API (bbox: {bbox_xmin:.0f}, {bbox_ymin:.0f}, {bbox_xmax:.0f}, {bbox_ymax:.0f})...")
+    st.info(f"Ophalen van gebouwen uit 3DBAG API...")
+    current_url = f"{base_url}?bbox={bbox_xmin},{bbox_ymin},{bbox_xmax},{bbox_ymax}&limit={limit}"
     
-    # Fetch all paginated results
-    while True:
-        params = {
-            'bbox': f"{bbox_xmin},{bbox_ymin},{bbox_xmax},{bbox_ymax}",
-            'limit': limit,
-            'offset': offset
-        }
-        
+    while current_url:
         try:
-            response = requests.get(base_url, params=params, timeout=30)
+            response = requests.get(current_url, timeout=30)
             response.raise_for_status()
             data = response.json()
             
-            # Extract features from response
             if 'features' in data:
                 features = data['features']
-                if not features:
-                    break  # No more features
-                all_features.extend(features)
-                offset += limit
-                st.write(f"Fetched {len(all_features)} buildings so far...")
+                if features:
+                    all_features.extend(features)
+                    page += 1
+                    st.write(f"Pagina {page} opgehaald: {len(all_features)} gebouwen totaal...")
+            
+            if 'links' in data:
+                next_link = next((link['href'] for link in data['links'] if link['rel'] == 'next'), None)
+                current_url = next_link
             else:
                 break
                 
         except requests.exceptions.RequestException as e:
-            st.error(f"Error fetching data from 3DBAG API: {str(e)}")
+            st.error(f"Fout bij ophalen van 3DBAG API: {str(e)}")
             break
     
-    st.success(f"Successfully fetched {len(all_features)} buildings from 3DBAG API")
+    st.success(f"Succesvol {len(all_features)} gebouwen opgehaald van 3DBAG API")
     return all_features
 
 
-# Function to process CityJSONFeature and extract building data
 def process_cityjson_feature(feature, center_lat, center_lon, radius):
-    """
-    Process a single CityJSONFeature and extract relevant building information.
-    
-    Returns:
-        dict with building info or None if building should be excluded
-    """
-    # Transform coordinates from RD to WGS84
+    """Process a single CityJSONFeature"""
     transformer = Transformer.from_crs("EPSG:7415", "EPSG:4326", always_xy=True)
     
-    # Extract building attributes
     if 'properties' not in feature:
         return None
     
@@ -123,40 +95,37 @@ def process_cityjson_feature(feature, center_lat, center_lon, radius):
     building_height = building_max - building_maaiveld
     building_height_rounded = round(building_height)
     
-    # Extract geometry
     if 'geometry' not in feature or 'coordinates' not in feature['geometry']:
         return None
     
     geometry = feature['geometry']
     
-    # Handle different geometry types
     if geometry['type'] == 'MultiSurface':
-        # Process MultiSurface geometry
         all_vertices = []
-        for surface in geometry['coordinates']:
-            for ring in surface:
-                for coord in ring:
-                    lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
-                    all_vertices.append((lat, lon, height))
+        
+        try:
+            for surface in geometry['coordinates']:
+                for ring in surface:
+                    for coord in ring:
+                        lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
+                        all_vertices.append((lat, lon, height))
+        except (IndexError, KeyError, TypeError):
+            return None
         
         if not all_vertices:
             return None
         
-        # Calculate centroid
         latitudes = [v[0] for v in all_vertices]
         longitudes = [v[1] for v in all_vertices]
         centroid = (np.mean(latitudes), np.mean(longitudes))
         
-        # Check if within radius
         distance = geodesic((center_lat, center_lon), centroid).meters
         if distance > radius:
             return None
         
-        # Calculate area if not provided
         if ground_area is None:
-            # Simple area calculation from first surface
-            coords_2d = [(v[0], v[1]) for v in all_vertices[:len(geometry['coordinates'][0][0])]]
-            ground_area = calculate_area(coords_2d)
+            coords_2d = [(v[0], v[1]) for v in all_vertices[:min(len(all_vertices), 100)]]
+            ground_area = calculate_area(coords_2d) if len(coords_2d) >= 3 else 0
         
         return {
             'height': building_height_rounded,
@@ -169,9 +138,8 @@ def process_cityjson_feature(feature, center_lat, center_lon, radius):
     return None
 
 
-# Function to calculate area
 def calculate_area(vertices):
-    """Simple polygon area calculation (flat projection)"""
+    """Simple polygon area calculation"""
     if len(vertices) < 3:
         return 0
     area = 0
@@ -182,7 +150,6 @@ def calculate_area(vertices):
     return abs(area) / 2
 
 
-# Function to generate a combined HTML report
 def generate_combined_html(quadrant_data, histogram_base64, map_html, address, radius, building_height):
     current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     total_area_per_quadrant = math.pi * (radius**2) / 4
@@ -195,59 +162,38 @@ def generate_combined_html(quadrant_data, histogram_base64, map_html, address, r
         <title>Terreinruwheids Analyse - {address}</title>
         <style>
             body {{ font-family: Arial, sans-serif; margin: 40px; }}
-            h1, h2, h3 {{ color: #333; }}
-            .report-header {{ margin-bottom: 30px; }}
-            .container {{ display: flex; flex-direction: column; }}
-            .graph {{ margin-bottom: 20px; text-align: center; }}
-            .summary {{ margin-bottom: 40px; }}
+            h1, h2 {{ color: #333; }}
             table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
             th {{ background-color: #f2f2f2; }}
-            .map-container {{ width: 100%; height: 600px; margin: 20px 0; }}
         </style>
     </head>
     <body>
-        <div class="report-header">
-            <h1>Bepaling ruwheidslengte volgens EN-1991-1-4 art. 4.3.2</h1>
-            <h2>{address}</h2>
-            <p>Rapport gegenereerd op {current_date}</p>
-            <p>Analyse Parameters:</p>
-            <ul>
-                <li>Gebouwhoogte: {building_height} meters</li>
-                <li>Berekende straal: {radius} meters</li>
-                <li>Sector oppervlak: {total_area_per_quadrant:.0f} m²</li>
-            </ul>
-        </div>
-        
-        <div class="container">
-            <div class="graph">
-                <h2>Gebouwhoogte distributie</h2>
-                <img src="data:image/png;base64,{histogram_base64}" style="max-width: 600px;" />
-            </div>
-            
-            <div class="summary">
-                <h2>Sector analyse</h2>
-                <table>
-                    <tr>
-                        <th>Sector</th>
-                        <th>Sector oppervlak (m²)</th>
-                        <th>Bebouwd oppervlak (m²)</th>
-                        <th>Bebouwd percentage (%)</th>
-                        <th>Gemiddelde hoogte (m)</th>
-                        <th>z0 (m)</th>
-                        <th>Status</th>
-                    </tr>
-                    {"".join(f"<tr><td>{q['name']}</td><td>{q['total_area']}</td><td>{q['area']}</td><td>{q['built_percentage']}</td><td>{q['avg_height']}</td><td>{q['z0']}</td><td><strong>{q['status']}</strong></td></tr>" for q in quadrant_data)}
-                </table>
-            </div>
-            
-            <div class="map-section">
-                <h2>Gebouwhoogte kaart</h2>
-                <div class="map-container">
-                    {map_html}
-                </div>
-            </div>
-        </div>
+        <h1>Bepaling ruwheidslengte volgens EN-1991-1-4 art. 4.3.2</h1>
+        <h2>{address}</h2>
+        <p>Rapport gegenereerd op {current_date}</p>
+        <ul>
+            <li>Gebouwhoogte: {building_height} meters</li>
+            <li>Berekende straal: {radius} meters</li>
+            <li>Sector oppervlak: {total_area_per_quadrant:.0f} m²</li>
+        </ul>
+        <h2>Gebouwhoogte distributie</h2>
+        <img src="data:image/png;base64,{histogram_base64}" style="max-width: 600px;" />
+        <h2>Sector analyse</h2>
+        <table>
+            <tr>
+                <th>Sector</th>
+                <th>Sector oppervlak (m²)</th>
+                <th>Bebouwd oppervlak (m²)</th>
+                <th>Bebouwd percentage (%)</th>
+                <th>Gemiddelde hoogte (m)</th>
+                <th>z0 (m)</th>
+                <th>Status</th>
+            </tr>
+            {"".join(f"<tr><td>{q['name']}</td><td>{q['total_area']}</td><td>{q['area']}</td><td>{q['built_percentage']}</td><td>{q['avg_height']}</td><td>{q['z0']}</td><td><strong>{q['status']}</strong></td></tr>" for q in quadrant_data)}
+        </table>
+        <h2>Gebouwhoogte kaart</h2>
+        {map_html}
     </body>
     </html>
     """
@@ -308,18 +254,17 @@ def generate_pdf_report(quadrant_data, histogram_base64, map_html, address, radi
     return pdf_bytes
 
 
-# Streamlit App UI
+# Streamlit App
 st.title("Terreinruwheidsanalyse")
-st.write("Analyse van gebouwhoogte en ruwheidslengte van de bebouwing rond een gegeven adres volgens NEN-EN 1991-1-4 art 4.3.2.")
+st.write("Analyse van gebouwhoogte en ruwheidslengte volgens NEN-EN 1991-1-4 art 4.3.2.")
+st.info("ℹ️ Deze app haalt gebouwdata automatisch op van de 3DBAG API")
 
-# Check for OpenCage API key
 if "opencage" in st.secrets and "api_key" in st.secrets["opencage"]:
     opencage_key = st.secrets["opencage"]["api_key"]
 else:
     st.error("API Key is not configured. Please check your Streamlit Secrets.")
     st.stop()
 
-# Rate limiter
 if "last_request_time" not in st.session_state:
     st.session_state.last_request_time = 0
 
@@ -334,74 +279,63 @@ def can_make_request():
         st.warning(f"Even geduld. Nieuwe aanvraag mogelijk over {remaining:.1f} seconden.")
         return False
 
-# Input fields
 address = st.text_input("Voer het te analyseren adres in", "Kerkstraat 1, Amsterdam")
 building_height = st.number_input("Gebouwhoogte in meters", min_value=1.0, value=40.0, step=1.0)
 
 radius = calculate_radius(building_height)
 st.info(f"Gebaseerd op een gebouwhoogte van {building_height}m, is de te analyseren straal {radius}m.")
 
-# Run analysis button
 if st.button("Start Analyse") and opencage_key and can_make_request():
     with st.spinner("Verwerken van de gebouwdata..."):
         try:
-            # Geocode address
             geocoder = OpenCageGeocode(opencage_key)
             result = geocoder.geocode(address)
             
             if not result:
-                st.error("Address not found. Please try a different address.")
+                st.error("Adres niet gevonden. Probeer een ander adres.")
                 st.stop()
             
             location = result[0]['geometry']
             center_lat, center_lon = location['lat'], location['lng']
             
-            # Fetch buildings from API
             features = fetch_buildings_from_api(center_lat, center_lon, radius)
             
             if not features:
-                st.error("No buildings found in the specified area.")
+                st.error("Geen gebouwen gevonden in dit gebied.")
                 st.stop()
             
-            # Initialize accumulators
             heights = [0, 0, 0, 0]
             counts = [0, 0, 0, 0]
             areas = [0.0, 0.0, 0.0, 0.0]
             height_area_products = [0.0, 0.0, 0.0, 0.0]
             buildings_within_radius = []
             
-            # Process features
             progress_bar = st.progress(0)
             processed_buildings = []
             
             for idx, feature in enumerate(features):
                 progress_bar.progress((idx + 1) / len(features))
-                
                 building_data = process_cityjson_feature(feature, center_lat, center_lon, radius)
                 if building_data:
                     processed_buildings.append(building_data)
                     buildings_within_radius.append(building_data['height'])
             
-            st.success(f"Processed {len(processed_buildings)} buildings within radius")
+            st.success(f"{len(processed_buildings)} gebouwen verwerkt binnen de straal")
             
-            # Calculate statistics
             max_height = max(buildings_within_radius) if buildings_within_radius else 30
             
-            # Initialize map
             m = folium.Map(location=[center_lat, center_lon], zoom_start=16, tiles="cartodbpositron")
             colormap = linear.YlOrRd_09.scale(0, max_height)
             
-            # Add radius circle
             folium.Circle(
                 location=(center_lat, center_lon),
                 radius=radius,
                 color="black",
                 fill=True,
                 fill_opacity=0.1,
-                popup=f"Analysis Radius: {radius}m<br>Building Height: {building_height}m"
+                popup=f"Straal: {radius}m<br>Gebouwhoogte: {building_height}m"
             ).add_to(m)
             
-            # Add quadrant lines
             for angle in [0, 90, 180, 270]:
                 endpoint_lat = center_lat + (radius / 111320) * math.cos(math.radians(angle))
                 endpoint_lon = center_lon + (radius / (111320 * math.cos(math.radians(center_lat)))) * math.sin(math.radians(angle))
@@ -412,28 +346,25 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
                     dash_array="5,5"
                 ).add_to(m)
             
-            # Process each building
             for building in processed_buildings:
                 centroid = building['centroid']
                 height = building['height']
                 area = building['area']
                 
-                # Determine quadrant
                 if centroid[0] >= center_lat and centroid[1] >= center_lon:
-                    quadrant = 0  # Northeast
+                    quadrant = 0
                 elif centroid[0] >= center_lat and centroid[1] < center_lon:
-                    quadrant = 1  # Northwest
+                    quadrant = 1
                 elif centroid[0] < center_lat and centroid[1] >= center_lon:
-                    quadrant = 2  # Southeast
+                    quadrant = 2
                 else:
-                    quadrant = 3  # Southwest
+                    quadrant = 3
                 
                 heights[quadrant] += height
                 counts[quadrant] += 1
                 areas[quadrant] += area
                 height_area_products[quadrant] += area * height
                 
-                # Add polygon to map
                 color = colormap(height)
                 vertices_2d = [(v[0], v[1]) for v in building['vertices']]
                 polygon = folium.Polygon(
@@ -447,7 +378,6 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
                 polygon.add_child(folium.Tooltip(tooltip_text))
                 polygon.add_to(m)
             
-            # Create histogram
             fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
             counts_hist, bins, _ = plt.hist(buildings_within_radius, bins=10)
             plt.clf()
@@ -469,7 +399,6 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             buf.seek(0)
             histogram_base64 = base64.b64encode(buf.read()).decode('utf-8')
             
-            # Calculate quadrant statistics
             total_land_area_per_quadrant = math.pi * (radius**2) / 4
             z0_values = []
             quadrant_names = ['Noord Oost', 'Noord West', 'Zuid Oost', 'Zuid West']
@@ -523,7 +452,6 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             stats_html += "</div>"
             folium.Element(stats_html).add_to(m)
             
-            # Add quadrant markers
             quadrant_offsets = [
                 (radius / 2 / 111320, radius / 2 / (111320 * math.cos(math.radians(center_lat)))),
                 (radius / 2 / 111320, -radius / 2 / (111320 * math.cos(math.radians(center_lat)))),
@@ -543,8 +471,7 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             
             colormap.add_to(m)
             
-            # Display results in Streamlit
-            st.subheader("Analyse parameters", anchor=False)
+            st.subheader("Analyse parameters")
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Gebouwhoogte", f"{building_height} m")
@@ -553,7 +480,7 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             with col3:
                 st.metric("Sector oppervlak", f"{total_land_area_per_quadrant:.0f} m²")
             
-            st.subheader("Sector Resultaat", anchor=False)
+            st.subheader("Sector Resultaat")
             left_col, right_col = st.columns(2)
             
             for i, label in enumerate(quadrant_names):
@@ -574,14 +501,13 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             st.subheader("Gebouwhoogte Kaart")
             folium_static(m, width=700, height=700)
             
-            # Export buttons
             map_html = m._repr_html_()
             col1, col2, col3 = st.columns(3)
             
             with col1:
                 html_map = m.get_root().render()
                 st.download_button(
-                    label="Download Kaart as HTML",
+                    label="Download Kaart (HTML)",
                     data=html_map,
                     file_name="wind_location_map.html",
                     mime="text/html"
@@ -607,13 +533,11 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
                     )
                 except Exception as e:
                     st.warning("PDF export niet beschikbaar")
-                    st.error(f"Fout: {str(e)}")
         
         except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
+            st.error(f"Er is een fout opgetreden: {str(e)}")
             raise e
 
-# Sidebar instructions
 st.sidebar.markdown("""
 ## Instructies
 1. Voer het te analyseren adres (+plaats) in
@@ -622,4 +546,9 @@ st.sidebar.markdown("""
 4. Gebruik "Download Rapport" om een overzicht te downloaden
 
 ### About
-Deze app analyseert de hoogte van gebouwen en de r
+Deze app analyseert de hoogte van gebouwen en de ruwheidsparameters (z0) in de berekende straal rond een locatie.
+Elke sector wordt geclassificeerd als "bebouwd" of "onbebouwd" op basis van de z0-waarde.
+
+### Data bron
+Gebouwdata wordt opgehaald via de 3DBAG API (api.3dbag.nl)
+""")
