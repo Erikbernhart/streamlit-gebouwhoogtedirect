@@ -81,7 +81,9 @@ def process_cityjson_feature(feature, center_lat, center_lon, radius):
     """Process a single CityJSONFeature"""
     transformer = Transformer.from_crs("EPSG:7415", "EPSG:4326", always_xy=True)
     
+    # Debug: print feature structure for first feature
     if 'properties' not in feature:
+        st.warning(f"Feature missing properties: {list(feature.keys())}")
         return None
     
     props = feature['properties']
@@ -95,21 +97,70 @@ def process_cityjson_feature(feature, center_lat, center_lon, radius):
     building_height = building_max - building_maaiveld
     building_height_rounded = round(building_height)
     
-    if 'geometry' not in feature or 'coordinates' not in feature['geometry']:
+    if 'geometry' not in feature:
+        st.warning("Feature missing geometry")
         return None
     
     geometry = feature['geometry']
     
+    # Handle different geometry types from the API
     if geometry['type'] == 'MultiSurface':
         all_vertices = []
         
         try:
-            for surface in geometry['coordinates']:
-                for ring in surface:
-                    for coord in ring:
-                        lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
-                        all_vertices.append((lat, lon, height))
-        except (IndexError, KeyError, TypeError):
+            # MultiSurface structure from API
+            if 'coordinates' in geometry:
+                for surface in geometry['coordinates']:
+                    if isinstance(surface, list):
+                        for ring in surface:
+                            if isinstance(ring, list):
+                                for coord in ring:
+                                    if len(coord) >= 3:
+                                        lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
+                                        all_vertices.append((lat, lon, height))
+        except (IndexError, KeyError, TypeError) as e:
+            st.warning(f"Error parsing geometry: {e}")
+            return None
+        
+        if not all_vertices:
+            st.warning("No vertices found after transformation")
+            return None
+        
+        latitudes = [v[0] for v in all_vertices]
+        longitudes = [v[1] for v in all_vertices]
+        centroid = (np.mean(latitudes), np.mean(longitudes))
+        
+        distance = geodesic((center_lat, center_lon), centroid).meters
+        if distance > radius:
+            return None
+        
+        if ground_area is None:
+            coords_2d = [(v[0], v[1]) for v in all_vertices[:min(len(all_vertices), 100)]]
+            ground_area = calculate_area(coords_2d) if len(coords_2d) >= 3 else 0
+        
+        return {
+            'height': building_height_rounded,
+            'centroid': centroid,
+            'vertices': all_vertices,
+            'area': ground_area,
+            'distance': distance
+        }
+    
+    # Handle Solid geometry type (common in 3DBAG)
+    elif geometry['type'] == 'Solid':
+        all_vertices = []
+        
+        try:
+            if 'coordinates' in geometry:
+                # Solid has one shell containing multiple surfaces
+                for shell in geometry['coordinates']:
+                    for surface in shell:
+                        for ring in surface:
+                            for coord in ring:
+                                if len(coord) >= 3:
+                                    lon, lat, height = transformer.transform(coord[0], coord[1], coord[2])
+                                    all_vertices.append((lat, lon, height))
+        except (IndexError, KeyError, TypeError) as e:
             return None
         
         if not all_vertices:
@@ -303,6 +354,11 @@ if st.button("Start Analyse") and opencage_key and can_make_request():
             if not features:
                 st.error("Geen gebouwen gevonden in dit gebied.")
                 st.stop()
+            
+            # Debug: Show structure of first feature
+            if features:
+                with st.expander("🔍 Debug: Eerste gebouw structuur"):
+                    st.json(features[0])
             
             heights = [0, 0, 0, 0]
             counts = [0, 0, 0, 0]
