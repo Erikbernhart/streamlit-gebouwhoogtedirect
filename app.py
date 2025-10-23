@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import json
 import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -22,49 +21,6 @@ def calculate_area(polygon):
     """Calculate area of a polygon in m² using the Shoelace formula."""
     x, y = zip(*polygon)
     return 0.5 * abs(sum(i * j - k * l for i, j, k, l in zip(x, y[1:] + y[:1], y[1:] + y[:1], x[1:] + x[:1])))
-
-def process_cityjson_feature(cityjson_feature, center_lat, center_lon, radius):
-    """Extract building data from a CityJSON feature if available."""
-    processed_buildings = []
-
-    if 'CityObjects' not in cityjson_feature or 'vertices' not in cityjson_feature:
-        return None
-
-    for obj_id, obj in cityjson_feature['CityObjects'].items():
-        if obj['type'] != 'Building':
-            continue
-
-        geom = obj.get('geometry', [])
-        if not geom:
-            continue
-
-        boundaries = geom[0].get('boundaries', [])
-        if not boundaries:
-            continue
-
-        vertices = [cityjson_feature['vertices'][v] for surf in boundaries for v in surf[0]]
-        if not vertices:
-            continue
-
-        lats = [v[1] for v in vertices]
-        lons = [v[0] for v in vertices]
-        centroid = (np.mean(lats), np.mean(lons))
-        distance = geodesic((center_lat, center_lon), centroid).meters
-        if distance > radius:
-            continue
-
-        height = round(max(v[2] for v in vertices) - min(v[2] for v in vertices))
-        area = calculate_area(list(zip(lats, lons)))
-
-        processed_buildings.append({
-            "height": height,
-            "centroid": centroid,
-            "vertices": list(zip(lats, lons)),
-            "area": area,
-            "distance": distance,
-        })
-
-    return processed_buildings if processed_buildings else None
 
 def height_to_color(height):
     """Return a hex color depending on building height."""
@@ -150,9 +106,9 @@ if st_map.get("last_active_drawing"):
 
         st.info(f"Analyzing area around lat={center_lat:.5f}, lon={center_lon:.5f} within {radius} m")
 
-        # Query 3DBAG API
+        # Query 3DBAG API using GEOJSON
         bbox = [center_lon - 0.01, center_lat - 0.01, center_lon + 0.01, center_lat + 0.01]
-        url = f"https://api.3dbag.nl/collections/pand/items?bbox={','.join(map(str, bbox))}&f=cityjson"
+        url = f"https://api.3dbag.nl/collections/pand/items?bbox={','.join(map(str, bbox))}&f=geojson"
         resp = requests.get(url)
 
         processed_buildings, buildings_within_radius = [], []
@@ -164,11 +120,35 @@ if st_map.get("last_active_drawing"):
 
             for idx, feature in enumerate(features):
                 progress_bar.progress((idx + 1) / len(features))
-                building_data = process_cityjson_feature(feature, center_lat, center_lon, radius)
-                if building_data:
-                    processed_buildings.extend(building_data)
-                    for b in building_data:
-                        buildings_within_radius.append(b['height'])
+                props = feature.get("properties", {})
+                geom = feature.get("geometry", {})
+
+                if not geom or "coordinates" not in geom:
+                    continue
+
+                building_max = props.get("b3_h_dak_50p")
+                building_maaiveld = props.get("b3_h_maaiveld")
+                ground_area = props.get("b3_opp_grond")
+
+                if building_max is None or building_maaiveld is None:
+                    continue
+
+                height = round(building_max - building_maaiveld)
+                coords = geom["coordinates"][0]  # outer polygon ring
+                centroid = (np.mean([pt[1] for pt in coords]), np.mean([pt[0] for pt in coords]))
+
+                distance = geodesic((center_lat, center_lon), centroid).meters
+                if distance > radius:
+                    continue
+
+                processed_buildings.append({
+                    "height": height,
+                    "centroid": centroid,
+                    "vertices": [(pt[1], pt[0]) for pt in coords],
+                    "area": ground_area or 0,
+                    "distance": distance,
+                })
+                buildings_within_radius.append(height)
 
             if not processed_buildings:
                 st.warning("No buildings found within this radius.")
