@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import json
 import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -20,10 +21,51 @@ from folium.elements import Element
 def calculate_area(polygon):
     """Calculate area of a polygon in m² using the Shoelace formula."""
     x, y = zip(*polygon)
-    return 0.5 * abs(sum(i * j - k * l for i, j, k, l in zip(x, y[1:] + y[:1], y[1:] + y[:1], x[1:] + x[:1])))
+    return 0.5 * abs(sum(x[i] * y[(i+1) % len(polygon)] - x[(i+1) % len(polygon)] * y[i] for i in range(len(polygon))))
+
+def process_cityjson_feature(cityjson_feature, center_lat, center_lon, radius):
+    """Extract building data from a CityJSON feature."""
+    processed_buildings = []
+    if 'CityObjects' not in cityjson_feature or 'vertices' not in cityjson_feature:
+        return None
+
+    for obj_id, obj in cityjson_feature['CityObjects'].items():
+        if obj['type'] != 'Building':
+            continue
+
+        geom = obj.get('geometry', [])
+        if not geom:
+            continue
+
+        boundaries = geom[0].get('boundaries', [])
+        if not boundaries:
+            continue
+
+        vertices = [cityjson_feature['vertices'][v] for surf in boundaries for v in surf[0]]
+        if not vertices:
+            continue
+
+        lats = [v[1] for v in vertices]
+        lons = [v[0] for v in vertices]
+        centroid = (np.mean(lats), np.mean(lons))
+        distance = geodesic((center_lat, center_lon), centroid).meters
+        if distance > radius:
+            continue
+
+        height = round(max(v[2] for v in vertices) - min(v[2] for v in vertices))
+        area = calculate_area(list(zip(lats, lons)))
+
+        processed_buildings.append({
+            "height": height,
+            "centroid": centroid,
+            "vertices": list(zip(lats, lons)),
+            "area": area,
+            "distance": distance,
+        })
+
+    return processed_buildings if processed_buildings else None
 
 def height_to_color(height):
-    """Return a hex color depending on building height."""
     if height < 5:
         return "#c7e9b4"
     elif height < 15:
@@ -36,7 +78,6 @@ def height_to_color(height):
         return "#253494"
 
 def get_quadrant(lat, lon, center_lat, center_lon):
-    """Determine the quadrant relative to center."""
     return (
         "NE" if lat > center_lat and lon > center_lon else
         "NW" if lat > center_lat and lon < center_lon else
@@ -45,7 +86,6 @@ def get_quadrant(lat, lon, center_lat, center_lon):
     )
 
 def generate_combined_html(buildings_within_radius, z0, quadrant, avg_height, avg_area):
-    """Create HTML summary block for display on the map."""
     return f"""
     <div style='
         position: fixed;
@@ -68,7 +108,6 @@ def generate_combined_html(buildings_within_radius, z0, quadrant, avg_height, av
     """
 
 def generate_pdf_report(buildings_within_radius, z0, quadrant, avg_height, avg_area):
-    """Generate a simple PDF report."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
@@ -93,7 +132,7 @@ st.set_page_config(layout="wide")
 st.title("🏙️ 3DBAG Building Analyzer")
 st.markdown("Select a location and radius to analyze buildings within that area.")
 
-# Create map and Draw tool
+# Map and Draw tool
 m = folium.Map(location=[52.3676, 4.9041], zoom_start=13)
 Draw(export=False, position="topleft").add_to(m)
 st_map = st_folium(m, width=700, height=500)
@@ -106,49 +145,38 @@ if st_map.get("last_active_drawing"):
 
         st.info(f"Analyzing area around lat={center_lat:.5f}, lon={center_lon:.5f} within {radius} m")
 
-        # Query 3DBAG API using GEOJSON
-        bbox = [center_lon - 0.01, center_lat - 0.01, center_lon + 0.01, center_lat + 0.01]
-        url = f"https://api.3dbag.nl/collections/pand/items?bbox={','.join(map(str, bbox))}&f=geojson"
+        # ✅ Proper API call (your original working fetch)
+        bbox = [center_lon - 0.005, center_lat - 0.005, center_lon + 0.005, center_lat + 0.005]
+        url = f"https://api.3dbag.nl/collections/pand/items?bbox={bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
         resp = requests.get(url)
-
-        processed_buildings, buildings_within_radius = [], []
 
         if resp.status_code == 200:
             data = resp.json()
             features = data.get("features", [])
-            progress_bar = st.progress(0)
+            processed_buildings = []
+            buildings_within_radius = []
 
+            progress_bar = st.progress(0)
             for idx, feature in enumerate(features):
                 progress_bar.progress((idx + 1) / len(features))
-                props = feature.get("properties", {})
-                geom = feature.get("geometry", {})
 
-                if not geom or "coordinates" not in geom:
+                # Get CityJSON URL for each feature
+                cityjson_url = next((link["href"] for link in feature.get("links", []) if link["type"] == "application/city+json"), None)
+                if not cityjson_url:
                     continue
 
-                building_max = props.get("b3_h_dak_50p")
-                building_maaiveld = props.get("b3_h_maaiveld")
-                ground_area = props.get("b3_opp_grond")
-
-                if building_max is None or building_maaiveld is None:
+                cityjson_resp = requests.get(cityjson_url)
+                if cityjson_resp.status_code != 200:
                     continue
 
-                height = round(building_max - building_maaiveld)
-                coords = geom["coordinates"][0]  # outer polygon ring
-                centroid = (np.mean([pt[1] for pt in coords]), np.mean([pt[0] for pt in coords]))
-
-                distance = geodesic((center_lat, center_lon), centroid).meters
-                if distance > radius:
+                cityjson_feature = cityjson_resp.json()
+                buildings = process_cityjson_feature(cityjson_feature, center_lat, center_lon, radius)
+                if not buildings:
                     continue
 
-                processed_buildings.append({
-                    "height": height,
-                    "centroid": centroid,
-                    "vertices": [(pt[1], pt[0]) for pt in coords],
-                    "area": ground_area or 0,
-                    "distance": distance,
-                })
-                buildings_within_radius.append(height)
+                for b in buildings:
+                    processed_buildings.append(b)
+                    buildings_within_radius.append(b["height"])
 
             if not processed_buildings:
                 st.warning("No buildings found within this radius.")
@@ -170,7 +198,7 @@ if st_map.get("last_active_drawing"):
                 ax.set_title("Building Height Distribution")
                 st.pyplot(fig)
 
-                # Add buildings to map
+                # Add polygons
                 for b in processed_buildings:
                     folium.Polygon(
                         locations=b["vertices"],
@@ -180,12 +208,10 @@ if st_map.get("last_active_drawing"):
                         fill_opacity=0.6,
                     ).add_to(m)
 
-                # Add stats box to map
                 stats_html = generate_combined_html(buildings_within_radius, z0, quadrant, avg_height, avg_area)
                 Element(stats_html).add_to(m)
                 st_folium(m, width=700, height=500)
 
-                # PDF download
                 pdf_buf = generate_pdf_report(buildings_within_radius, z0, quadrant, avg_height, avg_area)
                 st.download_button(
                     "📄 Download PDF Report",
